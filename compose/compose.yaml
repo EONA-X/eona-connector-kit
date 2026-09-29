@@ -1,0 +1,388 @@
+# EONA-X participant connector — docker compose deployment
+#
+# Four services make a participant connector:
+#   identity-hub   — DID document, credential service, STS token endpoint
+#   control-plane  — DSP protocol endpoint, management API, contract negotiation
+#   data-plane     — provider public API and consumer data gateway
+#   vault          — HashiCorp Vault, holds every key and secret the three runtimes use
+# plus PostgreSQL, which holds everything else.
+#
+# Postgres and Vault are bundled here because this is the evaluation / local path.
+# To point at an external PostgreSQL or Vault instead, set POSTGRES_* / VAULT_* in
+# .env and start with the external override:
+#
+#     docker compose -f compose.yaml -f compose.external-datastores.yaml up -d
+#
+# ---------------------------------------------------------------------------
+# START-UP ORDERING — read this before changing depends_on
+# ---------------------------------------------------------------------------
+# All three connector runtimes share one PostgreSQL database and each carries a
+# Flyway migration set plus the shared set. The shared migration reshapes
+# edc_lease from a single-column primary key to a composite one; the other
+# runtimes' 0.14 baselines create tables with a single-column foreign key into
+# edc_lease. If one runtime applies the shared set before a sibling has applied
+# its own baseline, that sibling's baseline fails outright.
+#
+# That is what edc.migration.barrier.expected-modules (in each service's
+# config.properties) prevents: every runtime applies its own migrations, signals
+# on a coordination table, and waits for the others before touching the shared
+# set. The barrier therefore REQUIRES the three runtimes to be running at the
+# same time — chaining them with `depends_on: service_healthy` would deadlock,
+# because the first one would block in the barrier waiting for siblings that
+# compose has not started yet.
+#
+# So the three connectors depend only on postgres and vault, and start together.
+#
+# One consequence: the data-plane registers itself against the control-plane's
+# control API during boot, and that call is fatal if it fails. On a first boot
+# the two are released from the barrier at the same instant and the data-plane
+# may reach registration before the control-plane's HTTP server is listening.
+# `restart: unless-stopped` covers it — the data-plane exits and is restarted a
+# moment later, by which time the control-plane is up. One restart of
+# <project>-data-plane-1 on first boot is expected, not a fault.
+#
+# ---------------------------------------------------------------------------
+# BEFORE FIRST START
+# ---------------------------------------------------------------------------
+# Vault must already hold the participant key pair, or the identity-hub refuses
+# to boot. Run ../scripts/bootstrap.sh (or ../scripts/up.sh, which does the
+# whole sequence) before bringing the connectors up.
+
+name: ${COMPOSE_PROJECT_NAME:-eonax-connector}
+
+# ---------------------------------------------------------------------------
+# Shared fragments
+# ---------------------------------------------------------------------------
+
+x-datastore-deps: &datastore-deps
+  postgres:
+    condition: service_healthy
+  vault:
+    condition: service_healthy
+
+# Health probing for every EDC runtime: the observability context on port 8080.
+# The images declare HEALTHCHECK NONE, so compose has to supply one. They are
+# alpine-based and carry busybox wget but no curl.
+x-edc-healthcheck: &edc-healthcheck
+  test: ["CMD-SHELL", "wget -q -O /dev/null -T 5 http://127.0.0.1:8080/api/check/readiness || exit 1"]
+  interval: 10s
+  timeout: 6s
+  retries: 6
+  # Generous: the runtime serves no HTTP until Flyway has finished, and the
+  # migration barrier makes each runtime wait for its siblings. Keep this above
+  # MIGRATION_BARRIER_TIMEOUT_SECONDS.
+  start_period: ${EDC_HEALTHCHECK_START_PERIOD:-360s}
+
+# Vault settings are identical for all three runtimes: they must share one Vault,
+# because the identity-hub mints the STS client secret that the control-plane reads.
+x-vault-env: &vault-env
+  EDC_VAULT_HASHICORP_URL: ${VAULT_URL:-http://vault:8200}
+  EDC_VAULT_HASHICORP_TOKEN: ${VAULT_TOKEN:?VAULT_TOKEN must be set}
+  EDC_VAULT_HASHICORP_API_SECRET_PATH: ${VAULT_SECRET_PATH:-/v1/secret}
+  EDC_VAULT_HASHICORP_FOLDER: ${VAULT_FOLDER:-}
+  EDC_VAULT_HASHICORP_API_HEALTH_CHECK_PATH: ${VAULT_HEALTH_PATH:-/v1/sys/health}
+  EDC_VAULT_HASHICORP_HEALTH_CHECK_ENABLED: ${VAULT_HEALTH_CHECK_ENABLED:-true}
+  EDC_VAULT_HASHICORP_HEALTH_CHECK_STANDBY_OK: ${VAULT_HEALTH_CHECK_STANDBY_OK:-true}
+  EDC_VAULT_HASHICORP_TOKEN_TTL: ${VAULT_TOKEN_TTL:-300}
+  # edc.vault.hashicorp.token.scheduled-renew-enabled and .renew-buffer contain a
+  # hyphen and are set in config.properties instead — see the note there.
+
+# Datasource settings. All three runtimes point at the same database on purpose:
+# the data-plane's consumer gateway reads edc_edr_entry rows the control-plane
+# writes, so splitting them breaks data consumption.
+x-datasource-env: &datasource-env
+  EDC_DATASOURCE_DEFAULT_URL: jdbc:postgresql://${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-edc}${POSTGRES_JDBC_PARAMS:-}
+  EDC_DATASOURCE_DEFAULT_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+  EDC_DATASOURCE_DEFAULT_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+  # Flyway owns table creation. SqlSchemaBootstrapper must stay off.
+  EDC_SQL_SCHEMA_AUTOCREATE: "false"
+  EDC_MIGRATION_ENABLED: ${MIGRATION_ENABLED:-true}
+  EDC_MIGRATION_LOCK_RETRY_COUNT: ${MIGRATION_LOCK_RETRY_COUNT:-240}
+  # edc.migration.barrier.* are hyphenated and live in config.properties.
+
+services:
+
+  # =========================================================================
+  # PostgreSQL — bundled for evaluation
+  # =========================================================================
+  # Single database shared by all three runtimes, matching the reference
+  # deployment. For production, point POSTGRES_* at a managed instance and use
+  # compose.external-datastores.yaml.
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-edc}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      # Keeps initdb deterministic across host locales.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # =========================================================================
+  # HashiCorp Vault — bundled for evaluation
+  # =========================================================================
+  # !!! DEV MODE. NOT FOR PRODUCTION. !!!
+  # `vault server -dev` means: storage is IN MEMORY, the root token is a fixed
+  # string you chose in .env, there is no TLS, and the server auto-unseals.
+  # Every secret is lost when this container restarts — including the STS client
+  # secret the identity-hub minted, which is NOT regenerated on a later boot
+  # because the participant context already exists in PostgreSQL. Recovery after
+  # losing Vault is documented in .env.example under IH_SUPERUSER_FORCE_RECREATE.
+  #
+  # For anything real: run Vault separately with persistent storage, TLS and a
+  # scoped token (not the root token), and use compose.external-datastores.yaml.
+  vault:
+    image: ${VAULT_IMAGE:-hashicorp/vault:1.20.4}
+    restart: unless-stopped
+    command: ["server", "-dev"]
+    cap_add:
+      # The Vault binary mlocks its memory; without this the container logs a
+      # warning on every start. Harmless to grant, harmless to remove.
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN:?VAULT_TOKEN must be set}
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    volumes:
+      # Unused in dev mode (storage is in memory). Declared so that switching the
+      # command to a file-storage config has somewhere durable to write, and so
+      # that no host path is ever bind-mounted.
+      - vault-data:/vault/file
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${VAULT_HOST_PORT:-18200}:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 5 'http://127.0.0.1:8200/v1/sys/health?standbyok=true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # =========================================================================
+  # Identity Hub
+  # =========================================================================
+  # Owns the participant's identity: serves the did:web document, answers
+  # credential-service presentation queries from counterparties, and runs the
+  # STS token endpoint the control-plane authenticates against.
+  #
+  # On its first successful boot it creates the participant context from
+  # EDC_PARTICIPANT_ID + the key aliases + EDC_IH_API_SUPERUSER_SERVICES, and in
+  # doing so mints the STS client secret into Vault under
+  # "<participant DID>-sts-client-secret". Nothing else creates that secret.
+  identity-hub:
+    image: ${IDENTITY_HUB_IMAGE:-${EDC_IMAGE_REGISTRY:-ghcr.io}/${EDC_IMAGE_NAMESPACE:-eona-x/dataspace}/identity-hub-postgresql-hashicorpvault:${EDC_IMAGE_TAG:-latest}}
+    pull_policy: ${EDC_IMAGE_PULL_POLICY:-missing}
+    restart: unless-stopped
+    depends_on: *datastore-deps
+    environment:
+      <<: [*vault-env, *datasource-env]
+
+      EDC_FS_CONFIG: /app/config.properties
+      EDC_COMPONENT_ID: ${PARTICIPANT_ID:-participant}-identityhub
+
+      # --- identity ---
+      EDC_PARTICIPANT_ID: ${PARTICIPANT_DID:?PARTICIPANT_DID must be set}
+      EDC_IH_IAM_ID: ${PARTICIPANT_DID}
+      EDC_IAM_DID_WEB_USE_HTTPS: ${DID_WEB_USE_HTTPS:-false}
+
+      # --- key material (aliases, not secrets; the values live in Vault) ---
+      # The public key alias is a hard boot gate: the runtime throws if Vault
+      # does not already hold it. scripts/bootstrap.sh puts it there.
+      EDC_IAM_STS_PRIVATEKEY_ALIAS: ${VAULT_ALIAS_PRIVATE_KEY:-participant-signing-key}
+      EDC_IAM_STS_PUBLICKEY_ALIAS: ${VAULT_ALIAS_PUBLIC_KEY:-participant-signing-key-pub}
+      # The "#my-key" fragment is hardcoded in the seeding extension. Any other
+      # fragment desynchronises the published DID document from the STS "kid".
+      EDC_IAM_STS_PUBLICKEY_ID: ${PARTICIPANT_DID}#my-key
+
+      # Set true for ONE boot to delete and recreate the participant context,
+      # which re-mints the STS client secret into Vault. It also destroys the
+      # stored credentials and key-pair records — see .env.example.
+      EDC_IH_API_SUPERUSER_FORCE_RECREATE: ${IH_SUPERUSER_FORCE_RECREATE:-false}
+
+      # --- DID document service entries, seeded into the participant context ---
+      # These are the URLs counterparties use, so they must be the PUBLIC ones.
+      # PARTICIPANT_DID_B64 is base64url of the DID with no padding; keep it in
+      # step with PARTICIPANT_DID (scripts/bootstrap.sh verifies this).
+      EDC_IH_API_SUPERUSER_SERVICES: '[{"id":"dsp-url","type":"DSPMessaging","serviceEndpoint":"${PUBLIC_DSP_URL:-http://control-plane:8282/api/dsp}"},{"id":"credential-service-url","type":"CredentialService","serviceEndpoint":"${PUBLIC_CREDENTIALS_URL:-http://identity-hub:8282/api/credentials}/v1/participants/${PARTICIPANT_DID_B64:?PARTICIPANT_DID_B64 must be set}"}]'
+
+      # --- API ---
+      EDC_WEB_REST_CORS_ENABLED: ${CORS_ENABLED:-false}
+      EDC_WEB_REST_CORS_HEADERS: ${CORS_HEADERS:-Origin, Content-Type, Accept, Authorization}
+
+      # Ports and paths. These are the values the JVM actually binds — the image
+      # sets them as defaults and they are repeated here so that one place
+      # governs both the listener and the published port below.
+      WEB_HTTP_PORT: "8080"
+      WEB_HTTP_PATH: /api
+      WEB_HTTP_IDENTITY_PORT: "8181"
+      WEB_HTTP_IDENTITY_PATH: /api/identity
+      WEB_HTTP_CREDENTIALS_PORT: "8282"
+      WEB_HTTP_CREDENTIALS_PATH: /api/credentials
+      WEB_HTTP_DID_PORT: "8383"
+      WEB_HTTP_DID_PATH: /api/did
+      WEB_HTTP_STS_PORT: "8484"
+      WEB_HTTP_STS_PATH: /api/sts
+    volumes:
+      # The image's CMD names logging.properties and opentelemetry.properties on
+      # the java command line, so all three files must be present.
+      - ./config/identity-hub/config.properties:/app/config.properties:ro
+      - ./config/identity-hub/logging.properties:/app/logging.properties:ro
+      - ./config/identity-hub/opentelemetry.properties:/app/opentelemetry.properties:ro
+    ports:
+      # health/observability — never expose beyond localhost
+      - "${BIND_ADDRESS:-127.0.0.1}:${IH_DEFAULT_HOST_PORT:-38080}:8080"
+      # Identity API — participant contexts, key pairs, credential requests.
+      # THIS BUILD SERVES IT UNAUTHENTICATED (the launcher excludes the
+      # identity-hub authentication and authorization modules). Never route it
+      # to the internet without your own gateway in front.
+      - "${BIND_ADDRESS:-127.0.0.1}:${IH_IDENTITY_HOST_PORT:-38181}:8181"
+      # Credential Service API — must be reachable by counterparties.
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:${IH_CREDENTIALS_HOST_PORT:-38282}:8282"
+      # DID API — must be reachable at exactly the URL the did:web resolves to.
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:${IH_DID_HOST_PORT:-38383}:8383"
+      # STS — consumed by this participant's own control-plane in-network.
+      - "${BIND_ADDRESS:-127.0.0.1}:${IH_STS_HOST_PORT:-38484}:8484"
+    healthcheck: *edc-healthcheck
+
+  # =========================================================================
+  # Control Plane
+  # =========================================================================
+  # Speaks DSP to other connectors, hosts the management API, and signals data
+  # flows to the data-plane.
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:-${EDC_IMAGE_REGISTRY:-ghcr.io}/${EDC_IMAGE_NAMESPACE:-eona-x/dataspace}/control-plane-postgresql-hashicorpvault:${EDC_IMAGE_TAG:-latest}}
+    pull_policy: ${EDC_IMAGE_PULL_POLICY:-missing}
+    restart: unless-stopped
+    depends_on: *datastore-deps
+    environment:
+      <<: [*vault-env, *datasource-env]
+
+      EDC_FS_CONFIG: /app/config.properties
+      EDC_COMPONENT_ID: ${PARTICIPANT_ID:-participant}-controlplane
+
+      # --- identity ---
+      EDC_PARTICIPANT_ID: ${PARTICIPANT_DID:?PARTICIPANT_DID must be set}
+      EDC_IAM_ISSUER_ID: ${PARTICIPANT_DID}
+      EDC_IAM_DID_WEB_USE_HTTPS: ${DID_WEB_USE_HTTPS:-false}
+      # Hard boot requirement: the catalog-filtering extension declares it
+      # required, so the runtime will not start without it. For a standalone
+      # evaluation with no authority, set it to this participant's own DID.
+      DSE_AUTHORITY_DID: ${AUTHORITY_DID:?AUTHORITY_DID must be set}
+
+      # --- STS (remote, against this participant's own identity-hub) ---
+      # An in-network URL on purpose: it never has to leave the deployment.
+      EDC_IAM_STS_OAUTH_TOKEN_URL: ${STS_TOKEN_URL:-http://identity-hub:8484/api/sts/token}
+      EDC_IAM_STS_OAUTH_CLIENT_ID: ${PARTICIPANT_DID}
+      # An alias, not a secret. The value behind it is minted into Vault by the
+      # identity-hub and read from Vault at token time — which is why the two
+      # runtimes must share one Vault.
+      EDC_IAM_STS_OAUTH_CLIENT_SECRET_ALIAS: ${STS_CLIENT_SECRET_ALIAS:-${PARTICIPANT_DID}-sts-client-secret}
+
+      # --- endpoints ---
+      # What this connector advertises to peers. Must match the "dsp-url"
+      # service entry in the DID document.
+      EDC_DSP_CALLBACK_ADDRESS: ${PUBLIC_DSP_URL:-http://control-plane:8282/api/dsp}
+      # Where the data-plane signals back to. In-network, never the public host.
+      EDC_CONTROL_ENDPOINT: http://control-plane:8383/api/control
+
+      # --- API ---
+      EDC_WEB_REST_CORS_ENABLED: ${CORS_ENABLED:-false}
+      EDC_WEB_REST_CORS_HEADERS: ${CORS_HEADERS:-Origin, Content-Type, Accept, Authorization}
+
+      WEB_HTTP_PORT: "8080"
+      WEB_HTTP_PATH: /api
+      WEB_HTTP_MANAGEMENT_PORT: "8181"
+      WEB_HTTP_MANAGEMENT_PATH: /api/management
+      WEB_HTTP_PROTOCOL_PORT: "8282"
+      WEB_HTTP_PROTOCOL_PATH: /api/dsp
+      WEB_HTTP_CONTROL_PORT: "8383"
+      WEB_HTTP_CONTROL_PATH: /api/control
+      # The image also declares WEB_HTTP_ONBOARDING_PORT=8484, but no extension
+      # in this build registers an "onboarding" API context, so nothing listens
+      # on it. It is deliberately not carried over.
+    volumes:
+      - ./config/control-plane/config.properties:/app/config.properties:ro
+      - ./config/control-plane/logging.properties:/app/logging.properties:ro
+      - ./config/control-plane/opentelemetry.properties:/app/opentelemetry.properties:ro
+    ports:
+      # health/observability — never expose beyond localhost
+      - "${BIND_ADDRESS:-127.0.0.1}:${CP_DEFAULT_HOST_PORT:-18080}:8080"
+      # Management API — internal only. Protected by a static token when
+      # MANAGEMENT_API_AUTH_ENABLED=true (see config.properties).
+      - "${BIND_ADDRESS:-127.0.0.1}:${CP_MANAGEMENT_HOST_PORT:-18181}:8181"
+      # DSP — the one port that must be reachable by other connectors.
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:${CP_PROTOCOL_HOST_PORT:-18282}:8282"
+      # Control API (8383) is intentionally NOT published: it is unauthenticated
+      # and only the data-plane in this network needs it.
+    healthcheck: *edc-healthcheck
+
+  # =========================================================================
+  # Data Plane
+  # =========================================================================
+  # Registers itself against the control-plane at boot (fatal if that fails —
+  # see the START-UP ORDERING note at the top of this file), then moves data.
+  data-plane:
+    image: ${DATA_PLANE_IMAGE:-${EDC_IMAGE_REGISTRY:-ghcr.io}/${EDC_IMAGE_NAMESPACE:-eona-x/dataspace}/data-plane-postgresql-hashicorpvault:${EDC_IMAGE_TAG:-latest}}
+    pull_policy: ${EDC_IMAGE_PULL_POLICY:-missing}
+    restart: unless-stopped
+    depends_on: *datastore-deps
+    environment:
+      <<: [*vault-env, *datasource-env]
+
+      EDC_FS_CONFIG: /app/config.properties
+      EDC_COMPONENT_ID: ${PARTICIPANT_ID:-participant}-dataplane
+
+      EDC_PARTICIPANT_ID: ${PARTICIPANT_DID:?PARTICIPANT_DID must be set}
+
+      # --- registration against the control plane ---
+      EDC_DPF_SELECTOR_URL: ${DPF_SELECTOR_URL:-http://control-plane:8383/api/control/v1/dataplanes}
+      # This data-plane's own control API, sent in the registration payload.
+      EDC_CONTROL_ENDPOINT: http://data-plane:8383/api/control
+      # The externally reachable URL embedded in every EDR handed to a consumer.
+      # No trailing slash.
+      EDC_DATAPLANE_API_PUBLIC_BASEURL: ${PUBLIC_DATAPLANE_PUBLIC_URL:-http://data-plane:8181/api/public}
+
+      # --- transfer-proxy token keys (Vault aliases) ---
+      # The same key pair the identity-hub uses: one per participant.
+      EDC_TRANSFER_PROXY_TOKEN_SIGNER_PRIVATEKEY_ALIAS: ${VAULT_ALIAS_PRIVATE_KEY:-participant-signing-key}
+      EDC_TRANSFER_PROXY_TOKEN_VERIFIER_PUBLICKEY_ALIAS: ${VAULT_ALIAS_PUBLIC_KEY:-participant-signing-key-pub}
+
+      EDC_WEB_REST_CORS_ENABLED: ${CORS_ENABLED:-false}
+      EDC_WEB_REST_CORS_HEADERS: ${CORS_HEADERS:-Origin, Content-Type, Accept, Authorization}
+
+      WEB_HTTP_PORT: "8080"
+      WEB_HTTP_PATH: /api
+      WEB_HTTP_PUBLIC_PORT: "8181"
+      WEB_HTTP_PUBLIC_PATH: /api/public
+      WEB_HTTP_DATA_PORT: "8282"
+      WEB_HTTP_DATA_PATH: /api/data
+      WEB_HTTP_CONTROL_PORT: "8383"
+      WEB_HTTP_CONTROL_PATH: /api/control
+    volumes:
+      - ./config/data-plane/config.properties:/app/config.properties:ro
+      - ./config/data-plane/logging.properties:/app/logging.properties:ro
+      - ./config/data-plane/opentelemetry.properties:/app/opentelemetry.properties:ro
+    ports:
+      # health/observability — never expose beyond localhost
+      - "${BIND_ADDRESS:-127.0.0.1}:${DP_DEFAULT_HOST_PORT:-28080}:8080"
+      # Public API — the provider-side endpoint a remote consumer calls with the
+      # transfer-proxy token. Must be reachable by peers.
+      - "${PUBLIC_BIND_ADDRESS:-127.0.0.1}:${DP_PUBLIC_HOST_PORT:-28181}:8181"
+      # Consumer data gateway — YOUR side calls this with a contract-agreement id
+      # as the bearer token. It is unauthenticated beyond that, so it stays local.
+      - "${BIND_ADDRESS:-127.0.0.1}:${DP_DATA_HOST_PORT:-28282}:8282"
+      # Control API (8383) is intentionally NOT published.
+    healthcheck: *edc-healthcheck
+
+volumes:
+  postgres-data:
+  vault-data:

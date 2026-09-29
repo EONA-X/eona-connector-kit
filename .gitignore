@@ -1,0 +1,67 @@
+# =============================================================================
+# eona-x-connector-kit
+# =============================================================================
+# Nothing in this repository should ever contain a credential. The entries
+# below are the ones that would otherwise pick one up by accident.
+
+# --- your own configuration and everything derived from it -------------------
+# Un-anchored on purpose: the kit's idiom is "copy .env.example to .env", and
+# a .env dropped at the repository root — or next to the scripts — is the
+# obvious near-miss. Anchoring these to compose/ would let exactly that
+# through.
+.env
+.env.*
+!.env.example
+!**/.env.example
+# Written by scripts/bootstrap.sh: the participant private key, the public key,
+# the management API key and the generated DID document.
+compose/secrets/
+# Per-service overrides appended verbatim to config.properties.
+compose/config/*/extra.properties
+
+# --- key material and certificates -------------------------------------------
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.truststore
+
+# --- Helm ---------------------------------------------------------------------
+# Packaged charts and vendored dependencies.
+*.tgz
+charts/**/charts/
+charts/**/Chart.lock
+# Local value overrides. Keep the committed values-*.yaml examples.
+values-local*.yaml
+*.local.yaml
+*.secret.yaml
+
+# --- Kubernetes ---------------------------------------------------------------
+kubeconfig
+*.kubeconfig
+.kube/
+
+# --- HashiCorp Vault ----------------------------------------------------------
+# Unseal keys and root tokens printed by `vault operator init`.
+vault-init.json
+unseal-keys*
+
+# --- scratch ------------------------------------------------------------------
+*.log
+*.bak
+*.orig
+*.tmp
+tmp/
+out/
+
+# --- editors and OS -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

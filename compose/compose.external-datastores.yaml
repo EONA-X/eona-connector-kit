@@ -1,0 +1,46 @@
+# Override: bring your own PostgreSQL and Vault.
+#
+#   docker compose -f compose.yaml -f compose.external-datastores.yaml up -d
+#
+# It removes the bundled postgres and vault services from the default set and
+# drops the depends_on edges that pointed at them. Everything else — the three
+# connector runtimes, their config files, their ports — is unchanged.
+#
+# Set these in .env before using it:
+#   POSTGRES_HOST / POSTGRES_PORT / POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD
+#   POSTGRES_JDBC_PARAMS  e.g. ?sslmode=require
+#   VAULT_URL             e.g. https://vault.example.org:8200
+#   VAULT_TOKEN           a scoped token, not a root token
+#
+# Requirements on what you bring:
+#   - PostgreSQL: one empty database, and a role with schema-owner DDL rights.
+#     Flyway creates, drops and alters tables at boot; a read-write-only grant
+#     will not start. No seed SQL is needed.
+#   - Vault: KV v2 mounted at the path in VAULT_SECRET_PATH (default /v1/secret),
+#     and the key aliases seeded — run ../scripts/bootstrap.sh against it.
+#   - If Vault is served over HTTPS with a private CA, the JVMs need that CA in
+#     their trust store. Mount your own cacerts and set JAVA_TOOL_OPTIONS
+#     (-Djavax.net.ssl.trustStore=... -Djavax.net.ssl.trustStorePassword=...)
+#     on the three services; nothing here assumes a custom CA.
+#
+# `!reset` requires Docker Compose v2.24 or newer. The default (bundled) path in
+# compose.yaml uses no such feature.
+
+services:
+
+  postgres:
+    # Parked behind a profile that is never enabled, so it is not part of the
+    # default set and `docker compose up` ignores it entirely.
+    profiles: ["bundled-datastores-disabled"]
+
+  vault:
+    profiles: ["bundled-datastores-disabled"]
+
+  identity-hub:
+    depends_on: !reset {}
+
+  control-plane:
+    depends_on: !reset {}
+
+  data-plane:
+    depends_on: !reset {}
