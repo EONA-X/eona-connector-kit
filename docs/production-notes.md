@@ -338,9 +338,10 @@ Stated plainly, because finding them yourself at 2 a.m. is worse:
    documents the calls ([`onboarding.md`](onboarding.md)) rather than scripting
    them.
 5. **A non-default Vault KV mount or folder only half-works** (§3).
-6. **The data-plane restarts once on a first boot**, by design, because its
+6. **The data-plane may restart once on a first boot**, because its
    self-registration against the control-plane is fatal on failure and the
-   migration barrier releases both at the same instant.
+   migration barrier releases both at the same instant. It is a race: the first
+   boot observed with the compose kit had no restart at all.
 7. **The two paths differ on one security default**: compose turns management
    API authentication on; the Helm chart leaves it off to match the runtime.
    Decide deliberately, do not inherit.

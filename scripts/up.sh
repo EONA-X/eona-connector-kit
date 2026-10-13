@@ -36,7 +36,7 @@ if [ ! -f "$ENV_FILE" ]; then
 then edit it — at minimum POSTGRES_PASSWORD and VAULT_TOKEN — and run this again."
 fi
 
-"${SCRIPTS_DIR}/bootstrap.sh" ${BOOTSTRAP_ARGS[@]+"${BOOTSTRAP_ARGS[@]}"}
+KIT_CALLED_BY_UP=1 "${SCRIPTS_DIR}/bootstrap.sh" ${BOOTSTRAP_ARGS[@]+"${BOOTSTRAP_ARGS[@]}"}
 
 info "checking the connector images"
 check_connector_images fatal
@@ -47,6 +47,7 @@ compose up -d
 printf '\n'
 log "the three runtimes are migrating the database and waiting for each other"
 log "at the migration barrier; the first boot takes a few minutes"
+log "(the data-plane may restart once meanwhile; that is fine, a loop is not)"
 printf '\n'
 
 if [ "$SMOKE" -eq 1 ]; then

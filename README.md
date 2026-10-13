@@ -119,8 +119,11 @@ docs/
 
 ## Quickstart — Docker Compose
 
-Roughly ten minutes, most of it the first boot: the three runtimes migrate the
-database together and wait for each other at the migration barrier.
+Allow ten minutes the first time, most of it the first boot: the three runtimes
+migrate the database together and wait for each other at the migration barrier.
+The one first boot observed so far, on an 8 vCPU / 24 GB virtual machine with
+the images already loaded, had every container healthy in under four minutes
+(see the [reference machine](docs/prerequisites.md#reference-machine)).
 
 **You need:** Docker Engine with Compose v2, `openssl`, `curl`, `bash`, and the
 three connector images. If you have the source:
@@ -185,11 +188,12 @@ ok   data-plane is registered with the control-plane
 ok   STS issued a token — identity, key material and client secret all line up
 ```
 
-**One restart of the data-plane on first boot is expected, not a fault.** It
+**The data-plane may restart once on first boot; that is not a fault.** It
 registers itself against the control-plane during boot and that call is fatal if
 it fails; released from the migration barrier at the same instant as the
-control-plane, it sometimes gets there first. `restart: unless-stopped` covers
-it.
+control-plane, it can get there first. `restart: unless-stopped` covers it. It
+is a race, so zero restarts is just as normal (the first boot observed so far
+had none). A restart *loop* is the fault.
 
 Where things are, by default (all on loopback):
 
@@ -405,8 +409,8 @@ runtime resolves the alias from the Vault and, finding nothing, falls back to
 a setting that has no default. `scripts/seed-vault.sh` does this for you;
 if you changed `MANAGEMENT_API_KEY_ALIAS`, re-run it.
 
-**The data-plane restarted once on first boot.** Expected — see the quickstart.
-A restart *loop* is not: check `EDC_DPF_SELECTOR_URL`; it must be the
+**The data-plane restarted once on first boot.** Possible and harmless — see the
+quickstart. A restart *loop* is not: check `EDC_DPF_SELECTOR_URL`; it must be the
 in-network control-plane address, never the public hostname.
 
 **Control-plane logs STS failures right after a fresh install.** Also expected,

@@ -142,6 +142,12 @@ ok "wrote compose/secrets/did.json (see: scripts/did-document.sh, for where it m
 # Done
 # ---------------------------------------------------------------------------
 printf '\n'
+# up.sh starts the runtimes right after this and says what to expect itself;
+# the "start the connector with" hint is only for someone running bootstrap alone.
+if [ "${KIT_CALLED_BY_UP:-0}" = "1" ]; then
+  ok "bootstrap complete"
+  exit 0
+fi
 info "bootstrap complete — start the connector with:"
 if [ "$EXTERNAL_DATASTORES" = "1" ]; then
   printf '    cd %s && docker compose -f compose.yaml -f compose.external-datastores.yaml up -d\n' "${COMPOSE_DIR#"$KIT_ROOT"/}"
@@ -151,5 +157,6 @@ fi
 printf '    scripts/smoke-test.sh\n\n'
 log "On the first boot the three runtimes migrate the database together and"
 log "wait for each other at the migration barrier, so expect a few minutes"
-log "before anything answers. One restart of the data-plane is normal: it"
-log "registers against the control-plane and may get there a moment early."
+log "before anything answers. The data-plane may restart once (it registers"
+log "against the control-plane and can get there a moment early); that is fine,"
+log "and so is no restart at all. A restart loop is not."

@@ -242,6 +242,29 @@ not the topology this kit deploys.)
 | Docker Engine + **Compose v2**; **v2.24+** only if you use `compose.external-datastores.yaml` (it uses `!reset`) |
 | Optional: the `vault` CLI (the scripts use the HTTP API, so it is a convenience) |
 
+### Reference machine
+
+The only first boot observed so far ran on a virtual machine, with the bundled
+PostgreSQL and Vault, on the default configuration (a local evaluation: internal
+DID, no dataspace authority). It is an order of magnitude, not a sizing
+guarantee.
+
+| | |
+| --- | --- |
+| OS | Ubuntu 24.04 LTS |
+| CPU | 8 vCPU (as provisioned; `nproc` was not run) |
+| Memory | 23 GiB visible to the guest (`free -h`), 22 GiB free before the boot |
+| Disk | 23 GB root volume, 14 GB free before the boot |
+| Docker | Engine 29.8.0, Compose v5.5.1 |
+| Images | the three connector images, already on the machine before the boot (not pulled by the kit) |
+| Result | all five containers `healthy` in under 4 minutes; `scripts/smoke-test.sh` 15 passed, 0 failed, 0 skipped; 0 restarts on any container |
+
+What this does not tell you: how much memory the three JVMs actually use
+(not measured), how much disk the images and the database take after the boot
+(not measured), or how the kit behaves with less. Plan generously on disk: the
+test machine was at 92 % (1.9 GB free) and had to be cleaned before there was
+room for the images.
+
 ---
 
 ## 7. Readiness checklist
