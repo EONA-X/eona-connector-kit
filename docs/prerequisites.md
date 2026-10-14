@@ -131,6 +131,37 @@ If your connector sits behind a corporate firewall with no inbound path, that is
 a blocker you own, and it will surface as an obscure verification failure rather
 than a connection error. Sort it out before onboarding.
 
+**Check the outbound half by name, not only by address.** The connector resolves
+the authority's and every peer's `did:web` itself, from inside its containers.
+In some environments (UAT today) the DID host, such as
+`dse.uat.dataspace.eona-x.org`, has no public DNS record even though the
+ingress behind it is public. The symptom is `Error resolving DID … Connect
+timed out`, and a catalogue or negotiation that sits in `REQUESTING` forever.
+Test it from the container, not from your shell:
+
+```bash
+docker exec <project>-control-plane-1 getent hosts <authority host>
+```
+
+If it does not resolve and you cannot get a public record, pin the name in a
+`compose/compose.local.yaml` (git-ignored, layered last by the scripts):
+
+```yaml
+x-dse-hosts: &dse-hosts
+  - "dse.uat.dataspace.eona-x.org:<ingress ip>"
+
+services:
+  control-plane:
+    extra_hosts: *dse-hosts
+  identity-hub:
+    extra_hosts: *dse-hosts
+  data-plane:
+    extra_hosts: *dse-hosts
+```
+
+then `docker compose -f compose.yaml -f compose.local.yaml up -d`. A VPN to the
+environment also works but is not needed, and is often single-session.
+
 ---
 
 ## 4. Infrastructure you provide
