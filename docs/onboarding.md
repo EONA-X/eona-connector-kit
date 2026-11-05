@@ -131,8 +131,8 @@ What the first boot looks like, so you do not misread it:
    starts.
 3. The data-plane may exit once and restart. It registers itself against the
    control-plane during boot and that call is fatal if it fails; released from
-   the barrier at the same moment, it sometimes gets there first. **One restart
-   is expected; a restart loop is not.**
+   the barrier at the same moment, it can get there first. **One restart is
+   acceptable and so is none; a restart loop is not.**
 4. The control-plane logs STS failures until the identity-hub has created the
    participant context once — that is when the STS client secret is minted into
    Vault. It recovers on its own.

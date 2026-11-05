@@ -209,7 +209,7 @@ else
   bad "data-plane never became ready
      docker compose logs data-plane
      it registers against the control-plane at boot and exits if that fails;
-     one restart on a first boot is expected, a restart loop is not"
+     one restart on a first boot is acceptable, a restart loop is not"
 fi
 
 if [ -n "${MGMT_KEY}" ] || [ "$MANAGEMENT_API_AUTH_ENABLED" != "true" ]; then

@@ -38,8 +38,9 @@
 # the two are released from the barrier at the same instant and the data-plane
 # may reach registration before the control-plane's HTTP server is listening.
 # `restart: unless-stopped` covers it — the data-plane exits and is restarted a
-# moment later, by which time the control-plane is up. One restart of
-# <project>-data-plane-1 on first boot is expected, not a fault.
+# moment later, by which time the control-plane is up. It is a race: one restart
+# of <project>-data-plane-1 on first boot is not a fault, and neither is none
+# (the first boot observed so far had none). A restart loop is.
 #
 # ---------------------------------------------------------------------------
 # BEFORE FIRST START
