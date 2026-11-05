@@ -10,7 +10,9 @@ _common_sh_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd -- "${_common_sh_dir}/.." && pwd)"
 KIT_ROOT="$(cd -- "${SCRIPTS_DIR}/.." && pwd)"
 COMPOSE_DIR="${KIT_ROOT}/compose"
+# shellcheck disable=SC2034  # used by the scripts that source this file
 CONFIG_DIR="${COMPOSE_DIR}/config"
+# shellcheck disable=SC2034  # used by the scripts that source this file
 SECRETS_DIR="${COMPOSE_DIR}/secrets"
 ENV_FILE="${ENV_FILE:-${COMPOSE_DIR}/.env}"
 ENV_EXAMPLE="${COMPOSE_DIR}/.env.example"
@@ -64,22 +66,46 @@ service_image() {
   '
 }
 
+# Resolved value of one environment variable of one service, read from the
+# rendered configuration for the same reason as service_image. Prints nothing if
+# the service or the variable is not there.
+service_env() {
+  compose config 2>/dev/null | awk -v svc="$1" -v key="$2" '
+    /^services:/       { in_services = 1; next }
+    !in_services       { next }
+    /^  [^ ][^:]*:$/   { current = $1; sub(":$", "", current); next }
+    current == svc && $1 == key ":" { print $2; exit }
+  '
+}
+
 # Report on the three connector images. Docker's own error for a missing image
 # is whatever the registry host happens to answer, which for the "localhost"
 # default is meaningless, so say it plainly instead.
 #   check_connector_images fatal   -> exit if they cannot possibly be pulled
 #   check_connector_images warn    -> report and carry on
 check_connector_images() {
-  local mode="${1:-warn}" svc image missing=""
+  local mode="${1:-warn}" svc image missing="" unresolved=""
   for svc in control-plane data-plane identity-hub; do
     image="$(service_image "$svc")"
-    [ -n "$image" ] || continue
+    if [ -z "$image" ]; then
+      unresolved="${unresolved} ${svc}"
+      continue
+    fi
     if docker image inspect "$image" >/dev/null 2>&1; then
       log "present: $image"
     else
       missing="${missing} ${image}"
     fi
   done
+
+  # An image we could not even resolve must never be reported as available.
+  if [ -n "${unresolved// /}" ]; then
+    local umsg="could not resolve the image of:${unresolved}
+  'docker compose config' failed or printed no image. Run it from compose/
+  with --env-file ${ENV_FILE} to see why."
+    if [ "$mode" = "fatal" ]; then die "$umsg"; else warn "$umsg"; fi
+    return 1
+  fi
 
   if [ -z "${missing// /}" ]; then
     ok "all three connector images are available locally"
@@ -90,7 +116,9 @@ check_connector_images() {
   # registry there to pull from. Anything else might just need a pull.
   if [ "${EDC_IMAGE_REGISTRY:-ghcr.io}" = "localhost" ] \
      && [ -z "${CONTROL_PLANE_IMAGE:-}${DATA_PLANE_IMAGE:-}${IDENTITY_HUB_IMAGE:-}" ]; then
-    local msg="these images are not on this machine and cannot be pulled from 'localhost':
+    local msg
+    # shellcheck disable=SC2086  # $missing is a space-separated list on purpose
+    msg="these images are not on this machine and cannot be pulled from 'localhost':
 $(printf '      %s\n' $missing)
   Build them from the connector source:
       cd <dataspace-ecosystem checkout> && ./gradlew dockerize
@@ -126,6 +154,7 @@ load_env() {
 
   : "${PARTICIPANT_ID:?PARTICIPANT_ID is not set in $ENV_FILE}"
   : "${PARTICIPANT_DID:?PARTICIPANT_DID is not set in $ENV_FILE}"
+  : "${AUTHORITY_DID:?AUTHORITY_DID is not set in $ENV_FILE}"
   : "${VAULT_TOKEN:?VAULT_TOKEN is not set in $ENV_FILE}"
   : "${POSTGRES_USER:?POSTGRES_USER is not set in $ENV_FILE}"
   : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set in $ENV_FILE}"
@@ -179,14 +208,34 @@ load_env() {
 
   case "$VAULT_URL" in
     http://vault:*|https://vault:*)
-      VAULT_BUNDLED=1
       : "${VAULT_ADDR_HOST:=http://${bind_host}:${VAULT_HOST_PORT}}" ;;
     *)
-      VAULT_BUNDLED=0
       : "${VAULT_ADDR_HOST:=${VAULT_URL}}" ;;
   esac
 
   VAULT_ADDR_HOST="${VAULT_ADDR_HOST%/}"
+}
+
+# ---------------------------------------------------------------------------
+# did:web
+# ---------------------------------------------------------------------------
+# The URL a did:web resolves to. did:web:<host, %3A for a port>[:<path>...]
+# becomes https://<host>/<path>/did.json, or https://<host>/.well-known/did.json
+# when there is no path. http instead of https while DID_WEB_USE_HTTPS is not
+# true, matching what the runtimes themselves do.
+did_web_url() {
+  local did="$1" body host path scheme="https"
+  [ "${DID_WEB_USE_HTTPS:-false}" = "true" ] || scheme="http"
+  body="${did#did:web:}"
+  host="${body%%:*}"
+  path="${body#*:}"
+  host="${host//%3A/:}"
+  host="${host//%3a/:}"
+  if [ "$path" = "$body" ]; then
+    printf '%s://%s/.well-known/did.json' "$scheme" "$host"
+  else
+    printf '%s://%s/%s/did.json' "$scheme" "$host" "${path//:/\/}"
+  fi
 }
 
 # ---------------------------------------------------------------------------

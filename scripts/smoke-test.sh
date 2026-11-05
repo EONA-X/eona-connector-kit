@@ -18,18 +18,25 @@
 # A failing check prints what it means and what to look at. Exit status is 0
 # only if every required check passed.
 #
-# Usage: smoke-test.sh [--wait <seconds>]
-#   --wait   keep retrying the health checks for this long before giving up
-#            (default 420 — the first boot runs schema migrations and the three
-#            runtimes wait for each other at the migration barrier)
+# Usage: smoke-test.sh [--wait <seconds>] [--public]
+#   --wait    keep retrying the health checks for this long before giving up
+#             (default 420 — the first boot runs schema migrations and the three
+#             runtimes wait for each other at the migration barrier)
+#   --public  also resolve the participant's did:web through the URL a
+#             counterparty would use, and check that the service endpoints it
+#             advertises are not in-network names. Run from this host this only
+#             catches routing, TLS and DID mismatches as the host sees them; the
+#             real proof is the printed curl command, run from OUTSIDE.
 set -euo pipefail
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
 WAIT=420
+PUBLIC_CHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --wait) WAIT="${2:?--wait needs a number of seconds}"; shift 2 ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    --public) PUBLIC_CHECK=1; shift ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
@@ -208,7 +215,12 @@ fi
 if [ -n "${MGMT_KEY}" ] || [ "$MANAGEMENT_API_AUTH_ENABLED" != "true" ]; then
   dp_list="$( { [ -n "${MGMT_KEY}" ] && printf 'header = "x-api-key: %s"\n' "${MGMT_KEY}"; } \
     | secret_curl -sS --max-time 20 "${CP_MGMT}/v3/dataplanes" 2>/dev/null || true)"
-  if printf '%s' "$dp_list" | grep -q 'http://data-plane:8383'; then
+  # The URL the data-plane registers itself under is whatever compose.yaml sets
+  # as its EDC_CONTROL_ENDPOINT; read it rather than hardcoding a copy of it.
+  dp_control_url="$(service_env data-plane EDC_CONTROL_ENDPOINT)"
+  if [ -z "$dp_control_url" ]; then
+    skip "could not read EDC_CONTROL_ENDPOINT of the data-plane from the compose configuration"
+  elif printf '%s' "$dp_list" | grep -qF "$dp_control_url"; then
     pass "data-plane is registered with the control-plane"
   elif printf '%s' "$dp_list" | grep -qE '^\[[[:space:]]*\]$'; then
     bad "the control-plane knows of no data-plane.
@@ -248,6 +260,34 @@ else
      response: $(printf '%s' "$sts_body" | head -c 300)
      A missing private key in Vault under '${VAULT_ALIAS_PRIVATE_KEY}' is the usual cause."
   fi
+fi
+
+# ===========================================================================
+if [ "$PUBLIC_CHECK" -eq 1 ]; then
+  info "public reachability (--public)"
+  # ===========================================================================
+  public_did_url="$(did_web_url "$PARTICIPANT_DID")"
+  public_doc="$(curl -sS --max-time 15 "$public_did_url" 2>&1 || true)"
+  if printf '%s' "$public_doc" | grep -q "\"$PARTICIPANT_DID\""; then
+    pass "the DID resolves at ${public_did_url}"
+    if printf '%s' "$public_doc" | grep -qE '"serviceEndpoint"[[:space:]]*:[[:space:]]*"https?://(control-plane|identity-hub|data-plane)[:/]'; then
+      bad "the DID document advertises an in-network service endpoint.
+     Set PUBLIC_DSP_URL and PUBLIC_CREDENTIALS_URL to public URLs, then recreate
+     the participant context (IH_SUPERUSER_FORCE_RECREATE=true for one boot): the
+     service entries are only applied when the context is created."
+    else
+      pass "the DID document advertises no in-network service endpoint"
+    fi
+  else
+    bad "the DID does not resolve at ${public_did_url}
+     got: $(printf '%s' "$public_doc" | head -c 200)
+     That is where counterparties look. Route it to the identity-hub's DID API
+     (port 8383, base path /api/did) and check DID_WEB_USE_HTTPS and TLS."
+    skip "service endpoint check needs a resolvable DID document"
+  fi
+
+  log "from a machine OUTSIDE this network, this must return the same document:"
+  log "    curl -fsS ${public_did_url}"
 fi
 
 # ===========================================================================

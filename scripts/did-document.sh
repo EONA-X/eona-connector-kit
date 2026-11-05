@@ -113,20 +113,7 @@ ok "wrote ${OUT#"$KIT_ROOT"/}"
 # ---------------------------------------------------------------------------
 # Where it has to be reachable
 # ---------------------------------------------------------------------------
-# did:web:<host-with-%3A-for-a-port>[:<path>...] -> https://<host>/<path>/did.json
-did_body="${PARTICIPANT_DID#did:web:}"
-did_host="${did_body%%:*}"
-did_path="${did_body#*:}"
-did_host_decoded="${did_host//%3A/:}"
-did_host_decoded="${did_host_decoded//%3a/:}"
-scheme="https"
-[ "${DID_WEB_USE_HTTPS:-false}" = "true" ] || scheme="http"
-
-if [ "$did_path" = "$did_body" ]; then
-  resolve_url="${scheme}://${did_host_decoded}/.well-known/did.json"
-else
-  resolve_url="${scheme}://${did_host_decoded}/${did_path//:/\/}/did.json"
-fi
+resolve_url="$(did_web_url "$PARTICIPANT_DID")"
 
 printf '\n'
 info "this document must be served at:"

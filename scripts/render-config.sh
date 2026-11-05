@@ -25,8 +25,8 @@
 # artefacts: this script regenerates them, and --check verifies them.
 #
 # Usage: render-config.sh [--check]
-#   --check   render to a temporary file and report whether the committed files
-#             are up to date, without writing anything
+#   --check   render to a temporary file and report whether the config.properties
+#             files on disk are up to date, without writing anything
 set -euo pipefail
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
@@ -120,15 +120,20 @@ EOF
     return
   fi
   local entry alias did
-  # Space- or comma-separated alias=did pairs.
-  for entry in $(printf '%s' "$TRUSTED_ISSUERS" | tr ',' ' '); do
+  local -a entries
+  # Space- or comma-separated alias=did pairs. read -a splits on whitespace
+  # without pathname expansion, which an unquoted $(...) loop would apply.
+  read -ra entries <<< "$(printf '%s' "$TRUSTED_ISSUERS" | tr ',' ' ')"
+  for entry in ${entries[@]+"${entries[@]}"}; do
     case "$entry" in
       *=*) ;;
       *) die "TRUSTED_ISSUERS entry '$entry' is not of the form alias=did" ;;
     esac
     alias="${entry%%=*}"
     did="${entry#*=}"
-    [ -n "$alias" ] && [ -n "$did" ] || die "TRUSTED_ISSUERS entry '$entry' has an empty alias or DID"
+    if [ -z "$alias" ] || [ -z "$did" ]; then
+      die "TRUSTED_ISSUERS entry '$entry' has an empty alias or DID"
+    fi
     printf 'edc.iam.trusted-issuer.%s.id=%s\n' "$alias" "$did"
   done
 }

@@ -448,9 +448,21 @@ effect. Check `web.http.management.auth.*` in
 
 **`pull access denied`.** On `localhost/local/…` you have overridden the
 defaults and not built the images locally — see the prerequisites. On
-`ghcr.io/eona-x/dataspace/…`, you are likely behind a proxy that blocks it;
-authenticate with `docker login ghcr.io` or mirror the images into a registry
-you control.
+`ghcr.io/eona-x/dataspace/…`, either you are behind a proxy that blocks it, or
+the packages are still **private**: GHCR creates packages private, and making
+them public is a manual step in each package's settings. ghcr.io answers
+`denied` for a private package and for a missing one alike, so a login from an
+account that is not allowed to read them changes nothing. To tell whether the
+packages are public, ask for an anonymous token — it must answer `200`, not `401`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  "https://ghcr.io/token?scope=repository:eona-x/dataspace/control-plane-postgresql-hashicorpvault:pull"
+```
+
+While they are private, authenticate with `docker login ghcr.io` using a GitHub
+username and a personal access token with `read:packages`, from an account that
+can read the packages, or mirror the images into a registry you control.
 
 **Bundled Vault (non-dev, file storage) comes back sealed.** It has no
 auto-unseal. `vault operator unseal` after every restart, then restart the
