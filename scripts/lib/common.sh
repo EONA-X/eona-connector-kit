@@ -48,9 +48,12 @@ require_cmd() {
 compose() {
   # Docker Compose v2 only. The v1 "docker-compose" binary is not supported.
   # EXTERNAL_DATASTORES=1 layers the bring-your-own-Postgres/Vault override on
-  # top, exactly as the documented command line does.
+  # top, exactly as the documented command line does. A compose.local.yaml,
+  # if you have one, is layered last (git-ignored: extra_hosts, resource
+  # limits, anything specific to your host).
   local files=(-f compose.yaml)
   [ "${EXTERNAL_DATASTORES:-0}" = "1" ] && files+=(-f compose.external-datastores.yaml)
+  [ -f "${COMPOSE_DIR}/compose.local.yaml" ] && files+=(-f compose.local.yaml)
   ( cd "$COMPOSE_DIR" && docker compose "${files[@]}" --env-file "$ENV_FILE" "$@" )
 }
 
